@@ -1,5 +1,7 @@
 # vaultenv
 
+# This fork is only here as a stop-gap measure to publish binaries build by travis
+
 Run processes with secrets from [HashiCorp Vault]. It:
 
  1. Reads a list of required secrets
