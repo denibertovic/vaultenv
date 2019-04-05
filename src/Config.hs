@@ -1,19 +1,34 @@
+{-|
+Module      : Config
+Description : Read config from CLI options and environment
+
+This module uses optparse-applicative to parse CLI options. It augments the
+optparse parser with a mechanism to allow for overrides in environment
+variables.
+
+The main entry point is @parseOptionsFromEnvAndCli@.
+-}
 module Config
   ( Options(..)
   , MilliSeconds(..)
   , parseOptionsFromEnvAndCli
   , LogLevel(..)
+  , readConfigFromEnvFiles
   ) where
 
 import Control.Applicative ((<*>), (<|>))
-import Data.List (intercalate)
+import Data.List (intercalate, nubBy)
+import Data.Maybe (fromJust)
 import Data.Monoid ((<>))
-
+import Data.Version (showVersion)
 import Options.Applicative (value, long, auto, option, metavar, help, flag,
                             str, argument, many, strOption)
+import Paths_vaultenv (version) -- Magic to get the version field from cabal.
+import System.IO.Error (catchIOError)
 
+import qualified Configuration.Dotenv as DotEnv
 import qualified Options.Applicative as OptParse
-import qualified Options.Applicative.Builder.Internal as OptParse
+import qualified System.Directory as Dir
 import qualified Text.Read as Read
 
 -- | Type alias for enviornment variables, used for readability in this module.
@@ -38,6 +53,7 @@ data Options = Options
   , oRetryBaseDelay  :: MilliSeconds
   , oRetryAttempts   :: Int
   , oLogLevel        :: LogLevel
+  , oUsePath         :: Bool
   } deriving (Eq)
 
 instance Show Options where
@@ -54,6 +70,7 @@ instance Show Options where
     , "Base delay:     " ++ (show . unMilliSeconds $ oRetryBaseDelay opts)
     , "Retry attempts: " ++ (show $ oRetryAttempts opts)
     , "Log-level:      " ++ (show $ oLogLevel opts)
+    , "Use PATH:       " ++ (show $ oUsePath opts)
     ]
 
 -- | Behavior flags that we allow users to set via environment variables.
@@ -64,6 +81,7 @@ data EnvFlags = EnvFlags
   { efConnectTls :: Bool
   , efValidateCerts :: Bool
   , efInheritEnv :: Bool
+  , efUsePath :: Bool
   }
 
 -- | LogLevel to run vaultenv under. Under @Error@, which is the default, we
@@ -101,6 +119,7 @@ parseEnvFlags envVars
   { efConnectTls = lookupEnvFlag "VAULTENV_CONNECT_TLS"
   , efValidateCerts = lookupEnvFlag "VAULTENV_VALIDATE_CERTS"
   , efInheritEnv = lookupEnvFlag "VAULTENV_INHERIT_ENV"
+  , efUsePath = lookupEnvFlag "VAULTENV_USE_PATH"
   }
   where
     lookupEnvFlag key =
@@ -115,8 +134,12 @@ parseEnvFlags envVars
 optionsParserWithInfo :: EnvFlags -> [EnvVar] -> OptParse.ParserInfo Options
 optionsParserWithInfo envFlags localEnvVars =
   OptParse.info
-    (OptParse.helper <*> optionsParser envFlags localEnvVars)
-    (OptParse.fullDesc <> OptParse.header "vaultenv - run programs with secrets from HashiCorp Vault")
+    (OptParse.helper <*> versionOption <*> optionsParser envFlags localEnvVars)
+    (OptParse.fullDesc <> OptParse.header header)
+  where
+    versionOption = OptParse.infoOption (showVersion version) (long "version" <> help "Show version")
+    header = "vaultenv " ++ showVersion version ++ " - run programs with secrets from HashiCorp Vault"
+
 
 -- | Parser for our CLI options. Seems intimidating, but is straightforward
 -- once you know about applicative parsing patterns. We construct a parser for
@@ -184,6 +207,7 @@ optionsParser envFlags envVars = Options
     <*> baseDelayMs
     <*> retryAttempts
     <*> logLevel
+    <*> usePath
   where
     host
       =  strOption
@@ -270,6 +294,11 @@ optionsParser envFlags envVars = Options
       <> readValueFromEnvWithDefault "VAULTENV_LOG_LEVEL" Error envVars
       <> help ("Log-level to run vaultenv under. Options: 'error' or 'info'. " ++
                "Defaults to 'error'. Also configurable via VAULTENV_LOG_LEVEL")
+    usePath
+      =  flag (efInheritEnv envFlags) True
+      $  long "use-path"
+      <> help ("Use PATH for finding the executable that vaultenv should call. Default: " ++
+              "don't search PATH. Also configurable via VAULTENV_USE_PATH.")
 
 
 -- | Specialization of @readValueFromEnv@ that does not use a @Read@ instance.
@@ -313,3 +342,44 @@ readValueFromEnvWithDefault :: (Read a, OptParse.HasValue f)
 readValueFromEnvWithDefault key defVal envVars
   =  value defVal
   <> readValueFromEnv key envVars
+
+-- | Search for environment files in default locations and load them in order.
+--
+-- This function tries to read the following files in order to obtain
+-- environment configuration. This is implicit behavior and allows the user to
+-- configure vaultenv without setting up environment variables or passing CLI
+-- flags. This is nicer for interactive usage.
+readConfigFromEnvFiles :: IO [(String, String)]
+readConfigFromEnvFiles = do
+  xdgDir <- (Just <$> Dir.getXdgDirectory Dir.XdgConfig "vaultenv")
+    `catchIOError` (const $ pure Nothing)
+  cwd <- Dir.getCurrentDirectory
+  let
+    machineConfigFile = "/etc/vaultenv.conf"
+
+    userConfigFile :: Maybe FilePath
+    userConfigFile = fmap (++ "/vaultenv.conf") xdgDir
+    cwdConfigFile = cwd ++ "/.env"
+
+  -- @doesFileExist@ doesn't throw exceptions, it catches @IOError@s and
+  -- returns @False@ if those are encountered.
+  machineConfigExists <- Dir.doesFileExist machineConfigFile
+  machineConfig <- if machineConfigExists
+    then DotEnv.parseFile machineConfigFile
+    else pure []
+
+  userConfigExists <- case userConfigFile of
+     Nothing -> pure False
+     Just fp -> Dir.doesFileExist fp
+  userConfig <- if userConfigExists
+    then DotEnv.parseFile (fromJust userConfigFile) -- safe because of loadUserConfig
+    else pure []
+
+  cwdConfigExists <- Dir.doesFileExist cwdConfigFile
+  cwdConfig <- if cwdConfigExists
+    then DotEnv.parseFile cwdConfigFile
+    else pure []
+
+  -- Deduplicate, user config takes precedence over machine config
+  let config = nubBy (\(x, _) (y, _) -> x == y) $ cwdConfig ++ userConfig ++ machineConfig
+  pure config
